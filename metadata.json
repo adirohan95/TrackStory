@@ -1,0 +1,8 @@
+{
+  "name": "TrackStory",
+  "description": "Story chapter tracker and reader for Archive of Our Own (AO3) with automatic update checks and reading progress sync.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

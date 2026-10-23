@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply transition-colors duration-200;
+  }
+}
+
+/* Custom dark mode reading skin matching AO3 reader appearance */
+.reader-dark-skin {
+  background-color: #121212 !important;
+  color: #e0e0e0 !important;
+}
+
+.reader-dark-skin a {
+  color: #a8c7fa !important;
+}
+
+.reader-dark-skin input,
+.reader-dark-skin select,
+.reader-dark-skin textarea,
+.reader-dark-skin button {
+  background: #252525 !important;
+  color: #e0e0e0 !important;
+}
