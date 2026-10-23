@@ -1,5 +1,6 @@
 import { storyRepository } from './storyRepository';
 import { TrackedStory } from '../types/story';
+import { safeFetchJson } from './safeFetch';
 
 export class SyncScheduler {
   private intervalId: any = null;
@@ -62,7 +63,7 @@ export class SyncScheduler {
 
     try {
       // Use batch check endpoint with polite rate-limiting
-      const res = await fetch('/api/story/batch-check', {
+      const { results } = await safeFetchJson<{ results: any[] }>('/api/story/batch-check', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -75,31 +76,15 @@ export class SyncScheduler {
         }),
       });
 
-      if (res.ok) {
-        const { results } = await res.json();
-        for (const item of results) {
-          if (item.success && item.metadata) {
-            const beforeStory = storyRepository.getStoryById(item.id);
-            const saved = storyRepository.applySync(item.id, item.metadata);
-            if (saved && beforeStory && item.metadata.latestChapterNumber > beforeStory.latestChapter) {
-              updatedStories.push(saved);
-            }
-          } else if (!item.success) {
-            storyRepository.reportSyncError(item.id, item.error || 'Check failed');
+      for (const item of results) {
+        if (item.success && item.metadata) {
+          const beforeStory = storyRepository.getStoryById(item.id);
+          const saved = storyRepository.applySync(item.id, item.metadata);
+          if (saved && beforeStory && item.metadata.latestChapterNumber > beforeStory.latestChapter) {
+            updatedStories.push(saved);
           }
-        }
-      } else {
-        // Fallback: check one by one sequentially
-        for (const story of stories) {
-          try {
-            const meta = await storyRepository.fetchMetadata(story.workUrl);
-            const saved = storyRepository.applySync(story.id, meta);
-            if (saved && meta.latestChapterNumber > story.latestChapter) {
-              updatedStories.push(saved);
-            }
-          } catch (err: any) {
-            storyRepository.reportSyncError(story.id, err.message || 'Check failed');
-          }
+        } else if (!item.success) {
+          storyRepository.reportSyncError(item.id, item.error || 'Check failed');
         }
       }
 

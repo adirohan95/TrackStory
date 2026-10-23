@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { TrackedStory, ChapterContentResponse } from '../types/story';
 import { storyRepository } from '../services/storyRepository';
+import { safeFetchJson } from '../services/safeFetch';
 import { useTheme } from '../context/ThemeContext';
 import {
   ArrowLeft,
@@ -69,18 +70,45 @@ export const ReaderScreen: React.FC<ReaderScreenProps> = ({
         setSupported(isSupp);
 
         const cookie = storyRepository.getCookie();
-        const res = await fetch('/api/story/content', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: currentUrl, cookie }),
-        });
-
-        if (!res.ok) {
-          const errData = await res.json().catch(() => ({}));
-          throw new Error(errData.error || `Unable to load chapter content (HTTP ${res.status})`);
+        let data: ChapterContentResponse;
+        try {
+          data = await safeFetchJson<ChapterContentResponse>('/api/story/content', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url: currentUrl, cookie }),
+          });
+        } catch (fetchErr: any) {
+          // Provide comfortable in-reader advisory with link to open on AO3
+          data = {
+            title: story?.title || 'AO3 Chapter',
+            author: story?.author || 'AO3 Author',
+            workTitle: story?.title || 'AO3 Work',
+            chapterNumber: story?.lastReadChapter || 1,
+            totalChapters: story?.latestChapter || 1,
+            chapterTitle: story?.lastReadChapterTitle || 'Chapter',
+            summary: '<p><strong>Notice:</strong> Unable to load chapter text directly through reader proxy.</p>',
+            bodyHtml: `
+              <div style="padding: 24px; border: 1px solid #d97706; background: rgba(245, 158, 11, 0.08); border-radius: 12px; margin: 20px 0;">
+                <h3 style="margin-top: 0; font-size: 1.15rem; font-weight: 700; color: #b45309;">
+                  Live Chapter Available on AO3
+                </h3>
+                <p style="font-size: 0.95rem; line-height: 1.6; margin: 12px 0;">
+                  AO3 is currently not returning chapter text to the server proxy (${fetchErr.message || 'connection issue'}).
+                </p>
+                <p style="font-size: 0.95rem; line-height: 1.6; margin: 12px 0;">
+                  You can open and read this chapter directly on AO3 in your browser, and your reading progress will remain saved in TrackStory:
+                </p>
+                <div style="margin-top: 18px;">
+                  <a href="${currentUrl}" target="_blank" rel="noopener noreferrer" style="display: inline-block; padding: 10px 18px; background-color: #990000; color: #ffffff; text-decoration: none; font-weight: 600; border-radius: 8px; font-size: 0.9rem;">
+                    Read Directly on AO3 ↗
+                  </a>
+                </div>
+              </div>
+            `,
+            workUrl: currentUrl,
+          };
         }
 
-        const data: ChapterContentResponse = await res.json();
         if (!active) return;
         setChapterContent(data);
 

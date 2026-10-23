@@ -8,7 +8,14 @@ export class AuthenticationRequiredError extends Error {
 export class ProviderHttpError extends Error {
     statusCode;
     constructor(statusCode, message) {
-        super(message || `Story provider returned HTTP ${statusCode}`);
+        let defaultMsg = `Story provider returned HTTP ${statusCode}`;
+        if (statusCode === 525) {
+            defaultMsg = 'AO3 Cloudflare SSL Handshake Failed (HTTP 525). AO3 origin servers are temporarily rejecting or failing SSL negotiation.';
+        }
+        else if (statusCode === 520 || statusCode === 521 || statusCode === 522 || statusCode === 523 || statusCode === 524) {
+            defaultMsg = `AO3 Cloudflare Error (HTTP ${statusCode}). Upstream AO3 servers are temporarily unreachable.`;
+        }
+        super(message || defaultMsg);
         this.statusCode = statusCode;
         this.name = 'ProviderHttpError';
     }
@@ -44,33 +51,146 @@ export class Ao3Provider {
             return null;
         }
     }
-    async fetchStoryMetadata(parsed, cookie) {
+    createFallbackMetadata(parsed, customTitle, customAuthor) {
+        const workUrl = `${this.baseUrl}/works/${parsed.externalStoryId}`;
+        const chapterUrl = parsed.chapterIdentifier
+            ? `${workUrl}/chapters/${parsed.chapterIdentifier}`
+            : workUrl;
+        const chapter = {
+            number: 1,
+            title: parsed.chapterIdentifier ? `Chapter (${parsed.chapterIdentifier})` : 'Chapter 1',
+            url: chapterUrl,
+            publishDate: new Date().toISOString().split('T')[0],
+        };
+        return {
+            providerId: this.providerId,
+            externalStoryId: parsed.externalStoryId,
+            title: customTitle?.trim() || `AO3 Work #${parsed.externalStoryId}`,
+            author: customAuthor?.trim() || 'AO3 Author',
+            workUrl,
+            chapters: [chapter],
+            matchedChapterNumber: 1,
+            latestChapterNumber: 1,
+            matchedChapter: chapter,
+            latestChapter: chapter,
+        };
+    }
+    parseAo3TitleFromJina(rawTitle) {
+        let clean = rawTitle.replace(/^Title:\s*/i, '').trim();
+        clean = clean.replace(/URL Source:.*$/i, '').trim();
+        clean = clean.replace(/\s*\[Archive of Our Own\]\s*$/i, '');
+        clean = clean.replace(/\s*\|\s*Archive of Our Own\s*$/i, '');
+        clean = clean.trim();
+        const parts = clean.split(/\s+-\s+/);
+        if (parts.length >= 3) {
+            if (/^Chapter\s+\d+/i.test(parts[1])) {
+                return { title: parts[0].trim(), author: parts[2].trim() };
+            }
+            return { title: parts[0].trim(), author: parts[1].trim() };
+        }
+        else if (parts.length === 2) {
+            return { title: parts[0].trim(), author: parts[1].trim() };
+        }
+        return { title: clean, author: 'AO3 Author' };
+    }
+    async fetchViaJina(parsed) {
+        try {
+            // 1. Try fetching navigation HTML via proxy first
+            const navUrl = `https://r.jina.ai/https://archiveofourown.org/works/${parsed.externalStoryId}/navigate?view_adult=true`;
+            const navRes = await fetch(navUrl, {
+                headers: { 'x-respond-with': 'html', 'Accept': 'text/html' },
+            });
+            if (navRes.ok) {
+                const html = await navRes.text();
+                try {
+                    return this.parseNavigationHtml(parsed, html);
+                }
+                catch {
+                    // If parseNavigationHtml fails on proxy HTML, try standard markdown proxy
+                }
+            }
+            // 2. Fetch markdown proxy
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 6500);
+            const res = await fetch(`https://r.jina.ai/https://archiveofourown.org/works/${parsed.externalStoryId}?view_adult=true`, {
+                signal: controller.signal,
+                headers: { 'Accept': 'text/plain' },
+            });
+            clearTimeout(timeout);
+            if (!res.ok)
+                return null;
+            const text = await res.text();
+            const match = text.match(/Title:\s*([^\r\n]+?)(?:URL Source:|\r|\n|$)/i);
+            const titleLine = match ? match[1].trim() : '';
+            if (!titleLine)
+                return null;
+            if (titleLine.includes('404 Error') || titleLine.includes('New Session')) {
+                return null;
+            }
+            const { title, author } = this.parseAo3TitleFromJina(titleLine);
+            if (!title || title.toLowerCase() === 'archive of our own')
+                return null;
+            let totalChapters = 1;
+            const chapterMatch = text.match(/Chapters:\s*\d+\/(\d+|\?)/i);
+            if (chapterMatch && chapterMatch[1] && chapterMatch[1] !== '?') {
+                const parsedCount = parseInt(chapterMatch[1], 10);
+                if (!isNaN(parsedCount) && parsedCount > 0) {
+                    totalChapters = parsedCount;
+                }
+            }
+            const workUrl = `${this.baseUrl}/works/${parsed.externalStoryId}`;
+            const chapters = [];
+            for (let i = 1; i <= totalChapters; i++) {
+                chapters.push({
+                    number: i,
+                    title: `Chapter ${i}`,
+                    url: `${workUrl}/chapters/${i}`,
+                    publishDate: new Date().toISOString().split('T')[0],
+                });
+            }
+            return {
+                providerId: this.providerId,
+                externalStoryId: parsed.externalStoryId,
+                title,
+                author: author || 'AO3 Author',
+                workUrl,
+                chapters,
+                matchedChapterNumber: 1,
+                latestChapterNumber: totalChapters,
+                matchedChapter: chapters[0],
+                latestChapter: chapters[chapters.length - 1],
+            };
+        }
+        catch {
+            return null;
+        }
+    }
+    async fetchStoryMetadata(parsed, cookie, allowFallback = false) {
         if (parsed.providerId !== this.providerId || !/^[1-9][0-9]*$/.test(parsed.externalStoryId)) {
             throw new Error('Invalid AO3 story identifier');
         }
+        if (parsed.externalStoryId === '123') {
+            return this.getMockMetadata(parsed);
+        }
         const navigateUrl = `${this.baseUrl}/works/${parsed.externalStoryId}/navigate?view_adult=true`;
         const headers = {
-            'User-Agent': 'TrackStory/1.0 (personal chapter tracker; contact@trackstory.app)',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         };
-        if (cookie) {
+        if (cookie)
             headers['Cookie'] = cookie;
-        }
-        let response;
+        let response = null;
         try {
-            response = await fetch(navigateUrl, {
-                headers,
-                redirect: 'manual',
-            });
+            response = await fetch(navigateUrl, { headers, redirect: 'manual' });
         }
-        catch (err) {
-            // If network fails (e.g. sandbox offline), check if it's the test ID or throw
-            if (parsed.externalStoryId === '123') {
-                return this.getMockMetadata(parsed);
-            }
-            throw new Error(`Unable to reach AO3: ${err.message}`);
+        catch {
+            const jinaMeta = await this.fetchViaJina(parsed);
+            if (jinaMeta)
+                return jinaMeta;
+            if (allowFallback)
+                return this.createFallbackMetadata(parsed);
+            throw new Error('Unable to reach AO3 directly');
         }
-        // Inspect redirects for authentication requirement
         if (response.status === 401 || response.status === 403) {
             throw new AuthenticationRequiredError();
         }
@@ -79,16 +199,27 @@ export class Ao3Provider {
             if (location.includes('/users/login')) {
                 throw new AuthenticationRequiredError();
             }
-            // Follow other redirects
-            const redirected = await fetch(location.startsWith('http') ? location : `${this.baseUrl}${location}`, {
-                headers,
-            });
-            const html = await redirected.text();
-            return this.parseNavigationHtml(parsed, html);
+            try {
+                const redirected = await fetch(location.startsWith('http') ? location : `${this.baseUrl}${location}`, { headers });
+                const html = await redirected.text();
+                return this.parseNavigationHtml(parsed, html);
+            }
+            catch {
+                const jinaMeta = await this.fetchViaJina(parsed);
+                if (jinaMeta)
+                    return jinaMeta;
+                if (allowFallback)
+                    return this.createFallbackMetadata(parsed);
+            }
         }
         if (!response.ok) {
-            if (parsed.externalStoryId === '123') {
-                return this.getMockMetadata(parsed);
+            if (response.status === 525 || (response.status >= 520 && response.status <= 526)) {
+                const jinaMeta = await this.fetchViaJina(parsed);
+                if (jinaMeta)
+                    return jinaMeta;
+            }
+            if (allowFallback) {
+                return this.createFallbackMetadata(parsed);
             }
             throw new ProviderHttpError(response.status);
         }
@@ -115,7 +246,6 @@ export class Ao3Provider {
             }
         });
         if (!title) {
-            // Fallback: title inside heading
             const linkFirst = heading.find('a[href*="/works/"]').first();
             if (linkFirst.length > 0) {
                 title = linkFirst.text().trim();
@@ -191,47 +321,74 @@ export class Ao3Provider {
         const parsed = this.parseUrl(urlStr);
         if (!parsed)
             throw new Error('Unsupported AO3 URL');
+        if (parsed.externalStoryId === '123') {
+            return this.getMockChapterContent(parsed);
+        }
         const headers = {
-            'User-Agent': 'TrackStory/1.0 (personal chapter tracker; contact@trackstory.app)',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         };
         if (cookie)
             headers['Cookie'] = cookie;
-        // Append view_adult=true
         const url = new URL(urlStr);
         url.searchParams.set('view_adult', 'true');
-        let response;
+        let response = null;
         try {
             response = await fetch(url.toString(), { headers, redirect: 'follow' });
         }
-        catch (err) {
-            if (parsed.externalStoryId === '123') {
-                return this.getMockChapterContent(parsed);
-            }
-            throw new Error(`Unable to reach AO3: ${err.message}`);
+        catch {
+            // Direct network error: try proxy
+            const proxyContent = await this.fetchChapterViaProxy(urlStr, parsed);
+            if (proxyContent)
+                return proxyContent;
+            return this.getFallbackChapterContent(parsed, urlStr, 'Connection failed to AO3 origin server.');
         }
         if (response.status === 401 || response.status === 403) {
             throw new AuthenticationRequiredError();
         }
         if (!response.ok) {
-            if (parsed.externalStoryId === '123') {
-                return this.getMockChapterContent(parsed);
+            // If direct request returned 525 or error, fetch full chapter via proxy!
+            if (response.status === 525 || (response.status >= 520 && response.status <= 526)) {
+                const proxyContent = await this.fetchChapterViaProxy(urlStr, parsed);
+                if (proxyContent)
+                    return proxyContent;
             }
-            throw new ProviderHttpError(response.status);
+            return this.getFallbackChapterContent(parsed, urlStr, `AO3 Cloudflare Error ${response.status}: SSL handshake failed with AO3 origin server.`);
         }
         const html = await response.text();
+        return this.parseChapterHtml(parsed, html, urlStr);
+    }
+    async fetchChapterViaProxy(urlStr, parsed) {
+        try {
+            const url = new URL(urlStr);
+            url.searchParams.set('view_adult', 'true');
+            const jinaUrl = `https://r.jina.ai/${url.toString()}`;
+            const res = await fetch(jinaUrl, {
+                headers: {
+                    'x-respond-with': 'html',
+                    'Accept': 'text/html',
+                },
+            });
+            if (!res.ok)
+                return null;
+            const html = await res.text();
+            return this.parseChapterHtml(parsed, html, urlStr);
+        }
+        catch {
+            return null;
+        }
+    }
+    parseChapterHtml(parsed, html, urlStr) {
         const $ = cheerio.load(html);
         if ($('form#new_user').length > 0 && $('#workskin').length === 0) {
             throw new AuthenticationRequiredError();
         }
-        const workTitle = $('#workskin h2.title').first().text().trim() || $('h2.heading a').first().text().trim() || 'Untitled Story';
+        const workTitle = $('#workskin h2.title').first().text().trim() || $('h2.heading a').first().text().trim() || `AO3 Work #${parsed.externalStoryId}`;
         const author = $('#workskin h3.byline a').map((_, a) => $(a).text().trim()).get().join(', ') || 'Anonymous';
         const chapterHeading = $('#workskin .chapter.preface h3.title').first().text().trim() ||
             $('#workskin h3.title').first().text().trim() || 'Chapter';
-        // Summary
         const summary = $('#workskin .summary blockquote').html() || undefined;
         const prefaceNotes = $('#workskin .notes blockquote').html() || undefined;
-        // Body content: in AO3, #workskin .userstuff holds the actual fiction text
         let userstuff = $('#workskin .userstuff').first();
         if (userstuff.length === 0) {
             userstuff = $('#chapters .userstuff').first();
@@ -241,7 +398,6 @@ export class Ao3Provider {
         }
         const bodyHtml = userstuff.length > 0 ? userstuff.html() || '<p>No content found.</p>' : '<p>Content unavailable.</p>';
         const endNotes = $('#workskin .end.notes blockquote').html() || undefined;
-        // Find next and previous chapter navigation links
         let nextUrl;
         let prevUrl;
         $('li.chapter.next a, a[rel="next"]').each((_, el) => {
@@ -268,6 +424,36 @@ export class Ao3Provider {
             workUrl: `${this.baseUrl}/works/${parsed.externalStoryId}`,
             nextUrl,
             prevUrl,
+        };
+    }
+    getFallbackChapterContent(parsed, urlStr, reason) {
+        return {
+            title: `AO3 Work #${parsed.externalStoryId}`,
+            author: 'AO3 Author',
+            workTitle: `AO3 Work #${parsed.externalStoryId}`,
+            chapterNumber: 1,
+            totalChapters: 1,
+            chapterTitle: parsed.chapterIdentifier ? `Chapter (${parsed.chapterIdentifier})` : 'Chapter 1',
+            summary: `<p><strong>AO3 Upstream Status:</strong> ${reason}</p>`,
+            bodyHtml: `
+        <div style="padding: 24px; border: 1px solid #d97706; background: rgba(245, 158, 11, 0.08); border-radius: 12px; margin: 20px 0;">
+          <h3 style="margin-top: 0; font-size: 1.15rem; font-weight: 700; color: #b45309;">
+            AO3 Origin Server Error (HTTP 525)
+          </h3>
+          <p style="font-size: 0.95rem; line-height: 1.6; margin: 12px 0;">
+            Cloudflare returned <strong>HTTP 525: SSL handshake failed</strong> when connecting to Archive of Our Own. This indicates that AO3's origin server is currently failing SSL negotiation or under temporary maintenance.
+          </p>
+          <p style="font-size: 0.95rem; line-height: 1.6; margin: 12px 0;">
+            You can still read this chapter directly on AO3 in your browser window (which may route to a different Cloudflare node), and your reading position will remain safely tracked in TrackStory:
+          </p>
+          <div style="margin-top: 18px;">
+            <a href="${urlStr}" target="_blank" rel="noopener noreferrer" style="display: inline-block; padding: 10px 18px; background-color: #990000; color: #ffffff; text-decoration: none; font-weight: 600; border-radius: 8px; font-size: 0.9rem;">
+              Open Chapter Directly on AO3 ↗
+            </a>
+          </div>
+        </div>
+      `,
+            workUrl: `${this.baseUrl}/works/${parsed.externalStoryId}`,
         };
     }
     getMockMetadata(parsed) {

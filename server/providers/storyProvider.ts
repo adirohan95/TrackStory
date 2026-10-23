@@ -7,7 +7,7 @@ export interface StoryProvider {
   readonly baseUrl: string;
   canHandleUrl(url: string): boolean;
   parseUrl(url: string): ParsedStoryUrl | null;
-  fetchStoryMetadata(parsed: ParsedStoryUrl, cookie?: string): Promise<RemoteStoryMetadata>;
+  fetchStoryMetadata(parsed: ParsedStoryUrl, cookie?: string, allowFallback?: boolean): Promise<RemoteStoryMetadata>;
 }
 
 export class StoryProviderRegistry {

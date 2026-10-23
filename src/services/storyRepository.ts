@@ -1,4 +1,6 @@
 import { TrackedStory, RemoteStoryMetadata, ThemePreference } from '../types/story';
+import { safeFetchJson } from './safeFetch';
+import { parseAo3UrlClient, createClientFallbackMetadata } from './clientAo3Parser';
 
 const STORAGE_KEY = 'trackstory_tracked_stories';
 const THEME_KEY = 'trackstory_theme';
@@ -68,45 +70,82 @@ export class StoryRepository {
   }
 
   async checkUrlSupported(url: string): Promise<boolean> {
+    // Fast local verification first
+    if (parseAo3UrlClient(url) !== null) {
+      return true;
+    }
     try {
-      const res = await fetch('/api/story/check-url', {
+      const data = await safeFetchJson<{ supported: boolean }>('/api/story/check-url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url }),
       });
-      const data = await res.json();
-      return !!data.supported;
+      return !!data?.supported;
     } catch {
-      return false;
+      return parseAo3UrlClient(url) !== null;
     }
   }
 
-  async fetchMetadata(url: string): Promise<RemoteStoryMetadata> {
-    const res = await fetch('/api/story/metadata', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ url, cookie: this.getCookie() }),
-    });
-
-    if (!res.ok) {
-      const errData = await res.json().catch(() => ({}));
-      throw new Error(errData.error || `Failed to fetch story (HTTP ${res.status})`);
+  async fetchMetadata(
+    url: string,
+    allowFallback = false,
+    customTitle?: string,
+    customAuthor?: string
+  ): Promise<RemoteStoryMetadata> {
+    try {
+      return await safeFetchJson<RemoteStoryMetadata>('/api/story/metadata', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          url,
+          cookie: this.getCookie(),
+          allowFallback,
+          customTitle,
+          customAuthor,
+        }),
+      });
+    } catch (err: any) {
+      if (allowFallback) {
+        const localFallback = createClientFallbackMetadata(url, customTitle, customAuthor);
+        if (localFallback) return localFallback;
+      }
+      throw err;
     }
-
-    return await res.json();
   }
 
   find(url: string): TrackedStory | undefined {
-    // Match by work URL or story ID from url
     const match = url.match(/\/works\/([1-9][0-9]*)/);
     if (!match) return undefined;
     const storyId = match[1];
     return this.storiesCache.find(s => s.providerId === 'ao3' && s.externalStoryId === storyId);
   }
 
-  async addOrUpdate(url: string): Promise<TrackedStory> {
-    const remote = await this.fetchMetadata(url);
-    return this.applyReading(remote);
+  async addOrUpdate(
+    url: string,
+    allowFallback = false,
+    customTitle?: string,
+    customAuthor?: string
+  ): Promise<TrackedStory> {
+    try {
+      const remote = await this.fetchMetadata(url, allowFallback, customTitle, customAuthor);
+      return this.applyReading(remote);
+    } catch (err: any) {
+      // If error is 525, HTML error, or allowFallback was set, construct local metadata
+      const is525 = err.upstreamStatus === 525 || err.isCloudflareError || err.message?.includes('525');
+      const fallback = createClientFallbackMetadata(url, customTitle, customAuthor);
+
+      if (fallback && (allowFallback || is525 || err.message?.includes('HTML'))) {
+        const story = this.applyReading(fallback);
+        this.reportSyncError(
+          story.id,
+          is525
+            ? 'AO3 returned HTTP 525 (Cloudflare SSL handshake error). Saved locally; will sync when AO3 recovers.'
+            : 'Saved in offline mode. Will synchronize when online.'
+        );
+        return story;
+      }
+      throw err;
+    }
   }
 
   private applyReading(remote: RemoteStoryMetadata): TrackedStory {
@@ -117,7 +156,7 @@ export class StoryRepository {
     const timestamp = Date.now();
     const chapter = remote.matchedChapter;
 
-    const nextChapter = remote.chapters[chapter.number]; // chapter.number is 1-indexed, so remote.chapters[chapter.number] is the next chapter!
+    const nextChapter = remote.chapters[chapter.number];
 
     const entity: TrackedStory = {
       id: existing ? existing.id : `story_${remote.providerId}_${remote.externalStoryId}`,
@@ -153,27 +192,49 @@ export class StoryRepository {
   async recordPage(url: string): Promise<TrackedStory | null> {
     const current = this.find(url);
     if (!current) return null;
-    const remote = await this.fetchMetadata(url);
-    // If deleted in the meantime
-    if (!this.storiesCache.some(s => s.id === current.id)) return null;
-    return this.applyReading(remote);
+    try {
+      const remote = await this.fetchMetadata(url, true);
+      if (!this.storiesCache.some(s => s.id === current.id)) return null;
+      return this.applyReading(remote);
+    } catch {
+      return current;
+    }
   }
 
   async adjustChapter(id: string, chapterNumber: number): Promise<TrackedStory | null> {
     const existing = this.getStoryById(id);
     if (!existing) return null;
 
-    const remote = await this.fetchMetadata(existing.workUrl);
-    const targetChapterNum = Math.max(1, Math.min(chapterNumber, remote.latestChapterNumber));
-    const targetChapter = remote.chapters[targetChapterNum - 1];
+    try {
+      const remote = await this.fetchMetadata(existing.workUrl, true);
+      const targetChapterNum = Math.max(1, Math.min(chapterNumber, remote.latestChapterNumber));
+      const targetChapter = remote.chapters[targetChapterNum - 1] || {
+        number: targetChapterNum,
+        title: `Chapter ${targetChapterNum}`,
+        url: `${existing.workUrl}`,
+      };
 
-    const updatedRemote: RemoteStoryMetadata = {
-      ...remote,
-      matchedChapterNumber: targetChapterNum,
-      matchedChapter: targetChapter,
-    };
+      const updatedRemote: RemoteStoryMetadata = {
+        ...remote,
+        matchedChapterNumber: targetChapterNum,
+        matchedChapter: targetChapter,
+      };
 
-    return this.applyReading(updatedRemote);
+      return this.applyReading(updatedRemote);
+    } catch {
+      const idx = this.storiesCache.findIndex(s => s.id === id);
+      if (idx >= 0) {
+        const s = this.storiesCache[idx];
+        const updated = {
+          ...s,
+          lastReadChapter: Math.max(1, Math.min(chapterNumber, s.latestChapter)),
+        };
+        this.storiesCache[idx] = updated;
+        this.saveToStorage();
+        return updated;
+      }
+      return null;
+    }
   }
 
   saveScroll(id: string, chapterUrl: string, scrollY: number) {
@@ -188,6 +249,23 @@ export class StoryRepository {
         this.saveToStorage();
       }
     }
+  }
+
+  updateStoryDetails(id: string, title: string, author: string, latestChapter?: number): TrackedStory | null {
+    const idx = this.storiesCache.findIndex(s => s.id === id);
+    if (idx < 0) return null;
+    const current = this.storiesCache[idx];
+    const newLatest = latestChapter && latestChapter > 0 ? latestChapter : current.latestChapter;
+    const updated: TrackedStory = {
+      ...current,
+      title: title.trim() || current.title,
+      author: author.trim() || current.author,
+      latestChapter: newLatest,
+      syncError: null,
+    };
+    this.storiesCache[idx] = updated;
+    this.saveToStorage();
+    return updated;
   }
 
   delete(id: string) {

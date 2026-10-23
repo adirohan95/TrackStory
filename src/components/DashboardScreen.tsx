@@ -5,6 +5,7 @@ import { syncScheduler } from '../services/syncScheduler';
 import { useTheme } from '../context/ThemeContext';
 import { StoryCard } from './StoryCard';
 import { AddStoryDialog } from './AddStoryDialog';
+import { EditStoryDialog } from './EditStoryDialog';
 import { CookieSettingsModal } from './CookieSettingsModal';
 import {
   BookOpen,
@@ -35,9 +36,14 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ onRead, onExte
   const [addDialogOpen, setAddDialogOpen] = useState<boolean>(false);
   const [cookieModalOpen, setCookieModalOpen] = useState<boolean>(false);
   const [deletingStory, setDeletingStory] = useState<TrackedStory | null>(null);
+  const [editingStory, setEditingStory] = useState<TrackedStory | null>(null);
 
   const [themeMenuOpen, setThemeMenuOpen] = useState<boolean>(false);
   const themeMenuRef = useRef<HTMLDivElement>(null);
+
+  const handleSaveStoryDetails = (id: string, title: string, author: string, latestChapter: number) => {
+    storyRepository.updateStoryDetails(id, title, author, latestChapter);
+  };
 
   // Subscribe to story repository changes
   useEffect(() => {
@@ -75,13 +81,23 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ onRead, onExte
     }
   };
 
-  const handleAddUrl = async (url: string) => {
+  const handleAddUrl = async (
+    url: string,
+    allowFallback = false,
+    customTitle?: string,
+    customAuthor?: string
+  ) => {
     setBusy(true);
     setError(null);
     try {
-      await storyRepository.addOrUpdate(url);
+      await storyRepository.addOrUpdate(url, allowFallback, customTitle, customAuthor);
     } catch (err: any) {
-      setError(err.message || 'Unable to track story');
+      const msg =
+        err.upstreamStatus === 525 || err.message?.includes('525')
+          ? 'AO3 server is reporting HTTP 525 (Cloudflare SSL Handshake Failed). TrackStory can track this story locally while awaiting AO3 recovery.'
+          : err.message || 'Unable to track story';
+      setError(msg);
+      throw err;
     } finally {
       setBusy(false);
     }
@@ -263,6 +279,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ onRead, onExte
                   onExternal={onExternal}
                   onAdjustChapter={handleAdjustChapter}
                   onDelete={setDeletingStory}
+                  onEdit={setEditingStory}
                 />
               ))}
             </div>
@@ -285,6 +302,7 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ onRead, onExte
                   onExternal={onExternal}
                   onAdjustChapter={handleAdjustChapter}
                   onDelete={setDeletingStory}
+                  onEdit={setEditingStory}
                 />
               ))}
             </div>
@@ -310,6 +328,14 @@ export const DashboardScreen: React.FC<DashboardScreenProps> = ({ onRead, onExte
         onClose={() => setAddDialogOpen(false)}
         onTrack={handleAddUrl}
         onReadFirst={onRead}
+      />
+
+      {/* Edit Story Dialog */}
+      <EditStoryDialog
+        story={editingStory}
+        isOpen={Boolean(editingStory)}
+        onClose={() => setEditingStory(null)}
+        onSave={handleSaveStoryDetails}
       />
 
       {/* AO3 Cookie Settings Modal */}

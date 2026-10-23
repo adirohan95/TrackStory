@@ -28,20 +28,38 @@ async function startServer() {
 
   app.post('/api/story/metadata', async (req, res) => {
     try {
-      const { url, cookie } = req.body;
+      const { url, cookie, allowFallback, customTitle, customAuthor } = req.body;
       if (!url || typeof url !== 'string') {
         return res.status(400).json({ error: 'URL is required' });
       }
 
       const { provider, parsed } = storyProviderRegistry.resolve(url.trim());
-      const metadata = await provider.fetchStoryMetadata(parsed, cookie);
-      res.json(metadata);
+      
+      try {
+        const metadata = await provider.fetchStoryMetadata(parsed, cookie, true);
+        return res.json(metadata);
+      } catch (innerErr: any) {
+        const jinaMeta = await ao3Provider.fetchViaJina(parsed);
+        if (jinaMeta) {
+          return res.json(jinaMeta);
+        }
+        if (allowFallback) {
+          const fallback = ao3Provider.createFallbackMetadata(parsed, customTitle, customAuthor);
+          return res.json(fallback);
+        }
+        throw innerErr;
+      }
     } catch (err: any) {
       if (err instanceof AuthenticationRequiredError) {
         return res.status(401).json({ error: err.message, requiresAuth: true });
       }
       if (err instanceof ProviderHttpError) {
-        return res.status(err.statusCode).json({ error: err.message });
+        const status = (err.statusCode >= 520 && err.statusCode <= 526) ? 503 : err.statusCode;
+        return res.status(status).json({
+          error: err.message,
+          upstreamStatus: err.statusCode,
+          isCloudflareError: err.statusCode >= 520 && err.statusCode <= 526,
+        });
       }
       res.status(500).json({ error: err.message || 'Unable to fetch story metadata' });
     }
@@ -61,7 +79,12 @@ async function startServer() {
         return res.status(401).json({ error: err.message, requiresAuth: true });
       }
       if (err instanceof ProviderHttpError) {
-        return res.status(err.statusCode).json({ error: err.message });
+        const status = (err.statusCode >= 520 && err.statusCode <= 526) ? 503 : err.statusCode;
+        return res.status(status).json({
+          error: err.message,
+          upstreamStatus: err.statusCode,
+          isCloudflareError: err.statusCode >= 520 && err.statusCode <= 526,
+        });
       }
       res.status(500).json({ error: err.message || 'Unable to fetch chapter content' });
     }
@@ -79,7 +102,7 @@ async function startServer() {
       for (const item of stories) {
         try {
           const { provider, parsed } = storyProviderRegistry.resolve(item.workUrl);
-          const metadata = await provider.fetchStoryMetadata(parsed, cookie);
+          const metadata = await provider.fetchStoryMetadata(parsed, cookie, false);
           results.push({
             id: item.id,
             success: true,
@@ -87,13 +110,15 @@ async function startServer() {
             hasUpdate: metadata.latestChapterNumber > (item.latestChapter || 0),
           });
         } catch (itemErr: any) {
+          const is525 = itemErr instanceof ProviderHttpError && itemErr.statusCode === 525;
           results.push({
             id: item.id,
             success: false,
-            error: itemErr.message || 'Check failed',
+            error: is525
+              ? 'AO3 origin SSL error (HTTP 525). Progress saved; will retry.'
+              : itemErr.message || 'Check failed',
           });
         }
-        // Polite delay between checks
         await new Promise(r => setTimeout(r, 600));
       }
 

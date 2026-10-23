@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { TrackedStory } from '../types/story';
-import { ExternalLink, BookOpen, MoreVertical, ChevronRight, ChevronLeft, Trash2, AlertCircle } from 'lucide-react';
+import { ExternalLink, BookOpen, MoreVertical, ChevronRight, ChevronLeft, Trash2, AlertCircle, Edit3 } from 'lucide-react';
 
 interface StoryCardProps {
   story: TrackedStory;
@@ -9,6 +9,7 @@ interface StoryCardProps {
   onExternal: (url: string) => void;
   onAdjustChapter: (id: string, chapter: number) => void;
   onDelete: (story: TrackedStory) => void;
+  onEdit: (story: TrackedStory) => void;
 }
 
 export const StoryCard: React.FC<StoryCardProps> = ({
@@ -18,10 +19,12 @@ export const StoryCard: React.FC<StoryCardProps> = ({
   onExternal,
   onAdjustChapter,
   onDelete,
+  onEdit,
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
   const unreadCount = Math.max(0, story.latestChapter - story.lastReadChapter);
+  const isPlaceholder = story.title.startsWith('AO3 Work #') || story.author === 'AO3 Author';
 
   useEffect(() => {
     const handleOutsideClick = (e: MouseEvent) => {
@@ -46,6 +49,15 @@ export const StoryCard: React.FC<StoryCardProps> = ({
           <p className="text-sm text-gray-600 dark:text-gray-400 font-medium">
             by {story.author}
           </p>
+          {isPlaceholder && (
+            <button
+              onClick={() => onEdit(story)}
+              className="inline-flex items-center gap-1.5 mt-1.5 px-2.5 py-1 rounded-lg bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-xs font-semibold text-amber-800 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/60 transition-colors"
+            >
+              <Edit3 className="w-3.5 h-3.5" />
+              <span>Set real title & author name</span>
+            </button>
+          )}
         </div>
 
         {/* Manage Dropdown */}
@@ -83,6 +95,17 @@ export const StoryCard: React.FC<StoryCardProps> = ({
               >
                 <ChevronRight className="w-4 h-4" />
                 <span>+ Next chapter</span>
+              </button>
+
+              <button
+                onClick={() => {
+                  setMenuOpen(false);
+                  onEdit(story);
+                }}
+                className="w-full text-left px-3 py-2 text-sm text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-700/60 flex items-center gap-2"
+              >
+                <Edit3 className="w-4 h-4" />
+                <span>Edit title & author</span>
               </button>
 
               <div className="border-t border-gray-200 dark:border-gray-700 my-1" />
